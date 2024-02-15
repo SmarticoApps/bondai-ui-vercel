@@ -1,106 +1,65 @@
-// app/api/streamchat/route.ts
-import { 
-  StreamingTextResponse,
-  AIStreamCallbacksAndOptions,
-} from 'ai';
+import { kv } from '@vercel/kv'
+import { OpenAIStream, StreamingTextResponse } from 'ai'
+import OpenAI from 'openai'
 
-export const runtime = 'edge';
+import { auth } from '@/auth'
+import { nanoid } from '@/lib/utils'
 
-type Message = {
-  role: string;
-  content: any;
-};
+export const runtime = 'edge'
 
-function loadChatTemplate(messages: Message[]) {
-  /*
-  <|im_start|>system
-  You are a helpful assistant.<|im_end|>
-  <|im_start|>user
-  {query}<|im_end|>
-  <|im_start|>assistant
-  */
-  let chatMLPromptTemplate = "";
-  messages.forEach((message: Message) => {
-      chatMLPromptTemplate += `<|im_start|>${message.role}\n${message.content}<|im_end|>\n`;
-  });
-  chatMLPromptTemplate += `<|im_start|>assistant\n`
-  return chatMLPromptTemplate;
-}
-
-function parseFluxStream(response: Response) {
-  if (!response.body) {
-    throw new Error("Response body is null");
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let result;
-  let stop_sequences = ["<|im_end|>", "<|endoftext|>", "</s>"]
-  let stop_word = "<|im_end|>"
-
-  const readableStream = new ReadableStream({
-    async pull(controller) {
-      try {
-        result = await reader.read();
-        if (result.done) {
-          controller.close();
-        } else {
-          const chunkAsString = decoder.decode(result.value, { stream: true });
-          const chunk = JSON.parse(chunkAsString.replace("data:", ""));
-          console.log(chunk.token.text)
-          if (chunk.token.text.indexOf(stop_word) > -1) {
-            chunk.token.text = chunk.token.text.replace(stop_word, "")
-          }
-          controller.enqueue(chunk.token.text);
-        }
-      } catch (error) {
-        console.error('Error reading the stream', error);
-        controller.error(error);
-      }
-    }
-  });
-
-  return readableStream;
-}
-
-export async function FluxStream(
-  res: Response, 
-  cb?: AIStreamCallbacksAndOptions
-): Promise<ReadableStream> {
-  const AiStream = parseFluxStream(res);
-  return AiStream;
-}
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+})
 
 export async function POST(req: Request) {
   const json = await req.json()
-  const { messages } = json
-  let inputPrompt = loadChatTemplate(messages);
-  
-  const fetchResponse = await fetch('http://localhost:8081/generate_stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      'inputs': inputPrompt,
-      'parameters': {
-        'max_new_tokens': 1000,
-        'stream': true
-      }
+  const { messages, previewToken } = json
+  const userId = (await auth())?.user.id
+
+  if (!userId) {
+    return new Response('Unauthorized', {
+      status: 401
     })
-  });
+  }
 
-  const fluxStream = await FluxStream(fetchResponse, {
-    onStart: async () => {
-      console.log('Stream started');
-    },
-    onCompletion: async (completion) => {
-      console.log('Completion completed', completion);
-    },
-    onFinal: async (completion) => {
-      console.log('Stream completed', completion);
-    },
-    onToken: async (token) => {
-      console.log('Token received', token);
-    },
-  });
+  if (previewToken) {
+    openai.apiKey = previewToken
+  }
 
-  return new StreamingTextResponse(fluxStream)
+  const res = await openai.chat.completions.create({
+    model: 'gpt-3.5-turbo',
+    messages,
+    temperature: 0.7,
+    stream: true
+  })
+
+  const stream = OpenAIStream(res, {
+    async onCompletion(completion) {
+      const title = json.messages[0].content.substring(0, 100)
+      const id = json.id ?? nanoid()
+      const createdAt = Date.now()
+      const path = `/chat/${id}`
+      const payload = {
+        id,
+        title,
+        userId,
+        createdAt,
+        path,
+        messages: [
+          ...messages,
+          {
+            content: completion,
+            role: 'assistant'
+          }
+        ]
+      }
+      await kv.hmset(`chat:${id}`, payload)
+      await kv.zadd(`user:chat:${userId}`, {
+        score: createdAt,
+        member: `chat:${id}`
+      })
+    }
+  })
+
+  return new StreamingTextResponse(stream)
 }
